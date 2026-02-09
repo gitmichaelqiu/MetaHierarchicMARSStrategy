@@ -263,6 +263,9 @@ def add_regime_features(df: pd.DataFrame, detector: RegimeDetector) -> pd.DataFr
 
 if __name__ == "__main__":
     # Test the regime detector
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from data_loader import DataLoader
     
     loader = DataLoader()

@@ -14,6 +14,10 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Local imports
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from data_loader import DataLoader, get_benchmark_tickers
 from indicators import add_all_indicators
 from regime_detector import RegimeDetector, add_regime_features
@@ -250,7 +254,7 @@ def run_single_ticker_backtest(
 def plot_results(
     ticker: str,
     result: BacktestResult,
-    save_dir: str = 'Plots'
+    save_dir: str = 'Plots/v2'
 ) -> None:
     """
     Generate and save visualization plots.
