@@ -1,10 +1,12 @@
 """
-Market Regime Detection Module for MoA Trading Framework
-Uses Gaussian Mixture Models to classify market into 4 regimes:
-- Growth (Bull market with positive drift)
-- Stagnation (Sideways, mean-reverting)
-- Transition (High volatility, uncertain direction)
-- Crisis (Crash, extreme negative returns)
+V2 Market Regime Detection Module
+Uses Gaussian Mixture Models with RANK-BASED label assignment.
+
+Key V2 improvements over V1:
+- Rank-based regime assignment instead of hardcoded thresholds
+  (fixes NVDA being stuck in "Stagnation" despite +64% growth)
+- Efficiency ratio feature for better Growth vs Stagnation discrimination
+- Expanding-window retraining for adaptivity
 """
 
 import pandas as pd
@@ -18,7 +20,7 @@ warnings.filterwarnings('ignore')
 
 class RegimeDetector:
     """
-    GMM-based market regime detector.
+    GMM-based market regime detector with rank-based label assignment.
     Provides soft probability assignments across 4 market states.
     """
     
@@ -41,140 +43,157 @@ class RegimeDetector:
         lookback: int = 20,
         retrain_frequency: int = 60
     ):
-        """
-        Initialize the regime detector.
-        
-        Args:
-            n_regimes: Number of market regimes to detect
-            lookback: Rolling window for feature calculation
-            retrain_frequency: Days between model retraining
-        """
         self.n_regimes = n_regimes
         self.lookback = lookback
         self.retrain_frequency = retrain_frequency
         self.model: Optional[GaussianMixture] = None
         self.scaler = StandardScaler()
         self.is_fitted = False
-        self.regime_mapping: Dict[int, int] = {}  # Map GMM labels to semantic regimes
+        self.regime_mapping: Dict[int, int] = {}
+        self._fit_count = 0
+        self._last_retrain_idx = 0
         
     def extract_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Extract features for regime classification.
         
-        Features:
-        - Rolling return (mean momentum)
-        - Rolling volatility  
-        - Rolling skewness
-        - Rolling kurtosis
-        - Volatility trend (vol change)
-        - Efficiency (Return / Vol)
+        V2 adds efficiency_ratio for better Growth/Stagnation discrimination.
         """
         features = pd.DataFrame(index=df.index)
         
-        # Returns
         if 'returns' not in df.columns:
-            df['returns'] = df['close'].pct_change()
+            returns = df['close'].pct_change()
+        else:
+            returns = df['returns']
         
-        # Rolling features
-        rolling_return = df['returns'].rolling(self.lookback).mean()
-        rolling_vol = df['returns'].rolling(self.lookback).std() * np.sqrt(252)
-        
-        features['rolling_return'] = rolling_return
-        features['rolling_vol'] = rolling_vol
-        features['rolling_skew'] = df['returns'].rolling(self.lookback).skew()
-        features['rolling_kurt'] = df['returns'].rolling(self.lookback).kurt()
+        # Rolling features 
+        features['rolling_return'] = returns.rolling(self.lookback).mean()
+        features['rolling_vol'] = returns.rolling(self.lookback).std() * np.sqrt(252)
+        features['rolling_skew'] = returns.rolling(self.lookback).skew()
+        features['rolling_kurt'] = returns.rolling(self.lookback).kurt()
         
         # Volatility trend
         features['vol_change'] = features['rolling_vol'].pct_change(5)
         
-        # Price trend (normalized)
+        # Price vs SMA (normalized)
         sma_50 = df['close'].rolling(50).mean()
         features['price_vs_sma'] = (df['close'] - sma_50) / sma_50
         
-        # Efficiency (Sortino-like proxy: Return / Vol)
-        # Add epsilon to avoid div by zero
-        features['efficiency'] = rolling_return / (rolling_vol + 1e-6)
+        # V2 NEW: Efficiency Ratio (Kaufman)
+        # Direction / Volatility — high for trending, low for choppy
+        direction = abs(df['close'] - df['close'].shift(self.lookback))
+        volatility = returns.abs().rolling(self.lookback).sum() * df['close']
+        features['efficiency_ratio'] = (direction / volatility.replace(0, np.nan)).clip(0, 1)
         
-        # Drop NaN rows
         features = features.dropna()
-        
         return features
     
     def _assign_regime_labels(self, features: pd.DataFrame) -> None:
         """
-        Assign semantic meaning to GMM cluster labels using Relative Ranking.
+        V2: RANK-BASED regime assignment.
         
-        Robust Logic:
-        1. Cluster with Highest Return -> Growth
-        2. Cluster with Lowest Return -> Crisis
-        3. Of remaining, Cluster with Lowest Volatility -> Stagnation
-        4. Last remaining -> Transition
+        Instead of comparing cluster centers against hardcoded thresholds,
+        we RANK clusters by their key features and assign labels based on 
+        relative ordering. This naturally adapts to high-vol stocks like NVDA 
+        where "normal" volatility exceeds V1's hardcoded thresholds.
+        
+        Algorithm:
+        1. Compute composite scores for each regime type using RANKINGS
+        2. Use Hungarian-style greedy assignment (best score first)
         """
-        # Get cluster centers - unscaled for easier interpretation
         centers = pd.DataFrame(
             self.scaler.inverse_transform(self.model.means_),
             columns=features.columns
         )
         
+        n = self.n_regimes
+        
+        # Extract key features per cluster
+        returns_arr = centers['rolling_return'].values
+        vol_arr = centers['rolling_vol'].values
+        skew_arr = centers['rolling_skew'].values
+        vol_change_arr = centers['vol_change'].values
+        eff_ratio_arr = centers['efficiency_ratio'].values
+        
+        # Compute ranks (0 = lowest, n-1 = highest)
+        ret_rank = np.argsort(np.argsort(returns_arr)).astype(float)
+        vol_rank = np.argsort(np.argsort(vol_arr)).astype(float)
+        skew_rank = np.argsort(np.argsort(skew_arr)).astype(float)
+        vol_ch_rank = np.argsort(np.argsort(np.abs(vol_change_arr))).astype(float)
+        eff_rank = np.argsort(np.argsort(eff_ratio_arr)).astype(float)
+        
+        # Normalize ranks to [0, 1]
+        ret_rank /= max(1, n - 1)
+        vol_rank /= max(1, n - 1)
+        skew_rank /= max(1, n - 1)
+        vol_ch_rank /= max(1, n - 1)
+        eff_rank /= max(1, n - 1)
+        
+        # Score each cluster for each regime type using RANKS
+        regime_scores = np.zeros((n, 4))
+        
+        for i in range(n):
+            # Growth: highest return rank + high efficiency ratio + moderate vol
+            regime_scores[i, self.GROWTH] = (
+                ret_rank[i] * 3.0 + 
+                eff_rank[i] * 2.0 - 
+                vol_rank[i] * 0.5
+            )
+            
+            # Stagnation: low return rank + low vol rank + low efficiency ratio
+            regime_scores[i, self.STAGNATION] = (
+                (1 - abs(ret_rank[i] - 0.5) * 2) * 2.0 +  # middle return
+                (1 - vol_rank[i]) * 2.0 +                   # low vol
+                (1 - eff_rank[i]) * 1.5                      # low efficiency
+            )
+            
+            # Transition: high vol change + high vol + medium efficiency
+            regime_scores[i, self.TRANSITION] = (
+                vol_ch_rank[i] * 3.0 + 
+                vol_rank[i] * 2.0 -
+                abs(ret_rank[i] - 0.5) * 1.0  # neutral return preferred
+            )
+            
+            # Crisis: lowest return rank + high vol + negative skew
+            regime_scores[i, self.CRISIS] = (
+                (1 - ret_rank[i]) * 3.0 +  # low return
+                vol_rank[i] * 2.0 +          # high vol
+                (1 - skew_rank[i]) * 1.5     # negative skew
+            )
+        
+        # Greedy assignment: best score first
+        used_regimes = set()
         self.regime_mapping = {}
-        available_clusters = set(range(self.n_regimes))
         
-        # 1. Identify Growth (Highest Return)
-        # Check: Growth must have positive return
-        growth_candidates = centers[centers['rolling_return'] > 0.0001]
-        if not growth_candidates.empty:
-            growth_cluster = growth_candidates['rolling_return'].idxmax()
-        else:
-            # No real growth, take best available but treat as Stagnation or Transition if weak
-            growth_cluster = centers['rolling_return'].idxmax()
+        for _ in range(n):
+            best_score = -np.inf
+            best_cluster = -1
+            best_regime = -1
             
-        self.regime_mapping[growth_cluster] = self.GROWTH
-        available_clusters.remove(growth_cluster)
-        
-        # 2. Identify Crisis (Lowest Return)
-        # Check: Crisis must have negative return
-        if available_clusters:
-            remaining_centers = centers.loc[list(available_clusters)]
-            min_ret_cluster = remaining_centers['rolling_return'].idxmin()
+            for cluster in range(n):
+                if cluster in self.regime_mapping:
+                    continue
+                for regime in range(4):
+                    if regime in used_regimes:
+                        continue
+                    if regime_scores[cluster, regime] > best_score:
+                        best_score = regime_scores[cluster, regime]
+                        best_cluster = cluster
+                        best_regime = regime
             
-            if centers.loc[min_ret_cluster, 'rolling_return'] < -0.0002: # -0.02% daily ~ -5% annualized
-                self.regime_mapping[min_ret_cluster] = self.CRISIS
-                available_clusters.remove(min_ret_cluster)
-            else:
-                # Lowest return is not negative enough for Crisis
-                # Map to Stagnation or Transition later
-                pass
-        
-        # 3. Identify Stagnation (Lowest Volatility) from remaining
-        if available_clusters:
-            vol_score = centers['rolling_vol'].loc[list(available_clusters)]
-            stagnation_cluster = vol_score.idxmin()
-            self.regime_mapping[stagnation_cluster] = self.STAGNATION
-            available_clusters.remove(stagnation_cluster)
-        
-        # 4. Remaining is Transition
-        if available_clusters:
-            for c in available_clusters:
-                self.regime_mapping[c] = self.TRANSITION
-            
-        # Fallback/Safety: If n_regimes > 4, map others to Transition
-        for i in range(self.n_regimes):
-            if i not in self.regime_mapping:
-                self.regime_mapping[i] = self.TRANSITION
+            if best_cluster >= 0:
+                self.regime_mapping[best_cluster] = best_regime
+                used_regimes.add(best_regime)
     
     def fit(self, df: pd.DataFrame) -> 'RegimeDetector':
-        """
-        Fit the GMM model on historical data.
-        """
+        """Fit the GMM model on historical data."""
         features = self.extract_features(df)
         
         if len(features) < 50:
             raise ValueError("Not enough data to fit regime detector")
         
-        # Scale features
         X = self.scaler.fit_transform(features)
         
-        # Fit GMM
         self.model = GaussianMixture(
             n_components=self.n_regimes,
             covariance_type='full',
@@ -183,34 +202,26 @@ class RegimeDetector:
         )
         self.model.fit(X)
         
-        # Assign semantic labels to clusters
         self._assign_regime_labels(features)
         
         self.is_fitted = True
+        self._fit_count += 1
         return self
     
     def predict_proba(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Get probability distribution over regimes.
-        
-        Returns:
-            DataFrame with columns: P(Growth), P(Stagnation), P(Transition), P(Crisis)
-        """
+        """Get probability distribution over regimes."""
         if not self.is_fitted:
             raise ValueError("Model not fitted. Call fit() first.")
         
         features = self.extract_features(df)
         X = self.scaler.transform(features)
         
-        # Get GMM probabilities
         gmm_probs = self.model.predict_proba(X)
         
-        # Map to semantic regimes
         regime_probs = np.zeros((len(features), 4))
         for gmm_label, regime_label in self.regime_mapping.items():
             regime_probs[:, regime_label] = gmm_probs[:, gmm_label]
         
-        # Create DataFrame
         prob_df = pd.DataFrame(
             regime_probs,
             index=features.index,
@@ -220,21 +231,14 @@ class RegimeDetector:
         return prob_df
     
     def predict(self, df: pd.DataFrame) -> pd.Series:
-        """
-        Get most likely regime for each time step.
-        """
+        """Get most likely regime for each time step."""
         probs = self.predict_proba(df)
         regime_ids = probs.values.argmax(axis=1)
         regime_names = [self.REGIME_NAMES[r] for r in regime_ids]
         return pd.Series(regime_names, index=probs.index, name='regime')
     
     def get_current_regime(self, df: pd.DataFrame) -> Tuple[str, Dict[str, float]]:
-        """
-        Get the current regime and probabilities.
-        
-        Returns:
-            (regime_name, {regime: probability})
-        """
+        """Get the current regime and probabilities."""
         probs = self.predict_proba(df)
         if len(probs) == 0:
             return 'Unknown', {}
@@ -254,42 +258,13 @@ class RegimeDetector:
 
 
 def add_regime_features(df: pd.DataFrame, detector: RegimeDetector) -> pd.DataFrame:
-    """
-    Add regime detection results to DataFrame.
-    """
+    """Add regime detection results to DataFrame."""
     probs = detector.predict_proba(df)
     regimes = detector.predict(df)
     
-    # Merge back
     df = df.copy()
     for col in probs.columns:
         df[col] = probs[col]
     df['regime'] = regimes
     
     return df
-
-
-if __name__ == "__main__":
-    # Test the regime detector
-    import sys
-    import os
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from data_loader import DataLoader
-    
-    loader = DataLoader()
-    df = loader.fetch_ticker('SPY', period='2y')
-    
-    print("Training Regime Detector...")
-    detector = RegimeDetector()
-    detector.fit(df)
-    
-    regime, probs = detector.get_current_regime(df)
-    print(f"\nCurrent Regime: {regime}")
-    print("Probabilities:")
-    for r, p in probs.items():
-        print(f"  {r}: {p:.2%}")
-    
-    # Show regime distribution
-    regimes = detector.predict(df)
-    print(f"\nRegime Distribution:")
-    print(regimes.value_counts())

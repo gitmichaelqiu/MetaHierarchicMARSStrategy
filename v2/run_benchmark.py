@@ -1,70 +1,72 @@
 """
-Benchmark Runner for MoA Trading Framework
-Tests the Mixture of Agents strategy on technology tickers.
+V2 MoA Trading Framework — Benchmark Runner
+Enhanced diagnostics with per-agent contribution tracking.
+
+Usage:
+    conda run -n ml python run_benchmark.py
 """
+
+import sys
+import os
+
+# Add project root to path for shared modules
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
-import os
 import warnings
 warnings.filterwarnings('ignore')
 
-# Local imports
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from data_loader import DataLoader, get_benchmark_tickers
 from indicators import add_all_indicators
-from regime_detector import RegimeDetector, add_regime_features
-from agents import TrendAgent, MeanReversionAgent, VolatilityAgent, CrisisAgent, ExponentialMomentumAgent, AgentSignal
-from moa_gating import MoAGatingNetwork
-from moa_ensemble import MoASoftEnsemble
-from meta_controller import MetaController
 from backtest_engine import BacktestEngine, BacktestResult
 
+from regime_detector import RegimeDetector
+from moa_gating import MoAGatingNetwork, GatingOutput
+from moa_ensemble import MoASoftEnsemble, EnsembleOutput
+from meta_controller import MetaController, ControllerOutput
 
-class MoAStrategy:
+# Add v1/ dir to sys.path so v1/agents package resolves naturally
+# (v2/agents was renamed to v2/v2_agents to avoid collision)
+V1_DIR = os.path.join(PROJECT_ROOT, 'v1')
+sys.path.insert(0, V1_DIR)
+
+from agents.trend_agent import TrendAgent
+from agents.mean_reversion_agent import MeanReversionAgent
+from agents.volatility_agent import VolatilityAgent
+from agents.crisis_agent import CrisisAgent
+
+# V2 new agent (from the renamed v2_agents directory)
+from v2_agents.exponential_momentum_agent import ExponentialMomentumAgent
+
+
+class MoAStrategyV2:
     """
-    Complete Mixture of Agents trading strategy.
+    V2 MoA Trading Strategy.
     
-    Integrates:
-    - Regime detection (GMM-based)
-    - 4 specialized agents
-    - Gating network (Top-K selection)
-    - Soft-ensemble voting
-    - Meta-controller for risk management
+    Key differences from V1:
+    - 5 agents (added ExponentialMomentumAgent)
+    - Top-K=3 gating
+    - No regime_fit dampening in ensemble
+    - Agreement floor for minimum position
+    - Direct position sizing (no Kelly, no smoothing)
     """
     
     def __init__(
         self,
-        top_k: int = 2,
-        gating_temperature: float = 1.0,
-        conflict_threshold: float = 0.6,  # Higher threshold - less penalty
+        top_k: int = 3,
+        gating_temperature: float = 0.8,
+        conflict_threshold: float = 0.8,
         transaction_cost: float = 0.001,
-        kelly_fraction: float = 1.0,  # Full Kelly for more aggressive sizing
-        retrain_freq: int = 60,
-        train_window: int = 252,
         debug: bool = True
     ):
-        """
-        Initialize the MoA strategy.
-        
-        Args:
-            top_k: Number of agents to select
-            gating_temperature: Temperature for gating softmax
-            conflict_threshold: Threshold for conflict detection
-            transaction_cost: Transaction cost per trade
-            kelly_fraction: Fraction of Kelly criterion for sizing
-            debug: Print debug information
-        """
-        self.debug = debug
-        
-        # Initialize components
         self.regime_detector = RegimeDetector()
         
         self.agents = {
@@ -72,111 +74,74 @@ class MoAStrategy:
             'MeanReversionAgent': MeanReversionAgent(),
             'VolatilityAgent': VolatilityAgent(),
             'CrisisAgent': CrisisAgent(),
-            'ExponentialMomentumAgent': ExponentialMomentumAgent()
+            'ExponentialMomentumAgent': ExponentialMomentumAgent(),
         }
         
         self.gating = MoAGatingNetwork(
             top_k=top_k,
-            temperature=gating_temperature
+            temperature=gating_temperature,
         )
         
         self.ensemble = MoASoftEnsemble(
-            conflict_threshold=conflict_threshold
+            conflict_threshold=conflict_threshold,
         )
         
-        # Use defaults from MetaController for more aggressive positioning
         self.controller = MetaController(
             transaction_cost=transaction_cost,
-            max_position=2.0  # Allow leverage
         )
         
-        self.retrain_freq = retrain_freq
-        self.train_window = train_window
-        self.last_train_idx = 0
-        
-        # State
-        self.is_fitted = False
-        self.debug_history: List[Dict] = []
-    
-    def fit(self, df: pd.DataFrame) -> 'MoAStrategy':
-        """Fit the regime detector on training data."""
-        print("  Training regime detector...")
-        self.regime_detector.fit(df)
-        self.is_fitted = True
-        self.last_train_idx = len(df)
-        return self
+        self.debug = debug
+        self.debug_log: List[Dict] = []
+        self._agent_contribution_sum: Dict[str, float] = {name: 0.0 for name in self.agents}
+        self._agent_activation_count: Dict[str, int] = {name: 0 for name in self.agents}
     
     def generate_signal(self, df: pd.DataFrame, current_idx: int) -> Tuple[float, str]:
-        """
-        Generate trading signal for the current bar.
+        """Generate trading signal for the current bar."""
         
-        Args:
-            df: Full DataFrame with OHLCV and indicators
-            current_idx: Current bar index
-            
-        Returns:
-            (position_pct, regime_name)
-        """
-        if not self.is_fitted:
-            return 0.0, 'Unknown'
-        
-        # Slice data up to current bar (no lookahead)
         current_data = df.iloc[:current_idx + 1]
         
-        if len(current_data) < 50:
-            return 0.0, 'Warmup'
-            
-        # Check for retraining
-        if self.is_fitted and (current_idx - self.last_train_idx >= self.retrain_freq):
-            # Retrain on rolling window
-            train_start = max(0, current_idx - self.train_window)
-            train_data = df.iloc[train_start:current_idx]
-            
-            # Ensure we have enough data and volatility isn't zero
-            if len(train_data) > 100:
-                try:
-                    self.regime_detector.fit(train_data)
-                    self.last_train_idx = current_idx
-                    if self.debug:
-                        print(f"    [Retrained Regime Detector at idx {current_idx}]")
-                except Exception as e:
-                    if self.debug:
-                        print(f"    [Retrain Failed: {e}]")
+        if len(current_data) < 60:
+            return 0.0, 'Unknown'
         
         # Get regime probabilities
-        try:
-            regime, regime_probs = self.regime_detector.get_current_regime(current_data)
-        except Exception as e:
-            return 0.0, 'Error'
+        regime_name, regime_probs = self.regime_detector.get_current_regime(current_data)
         
-        # Get current volatility
-        if 'hist_vol' in current_data.columns:
-            current_vol = current_data['hist_vol'].iloc[-1]
-            if pd.isna(current_vol):
-                current_vol = 0.25
+        if not regime_probs:
+            return 0.0, regime_name
+        
+        # Current volatility
+        if 'rolling_volatility' in df.columns:
+            current_vol = df['rolling_volatility'].iloc[current_idx]
+            if pd.isna(current_vol) or current_vol <= 0:
+                current_vol = 0.20
         else:
-            current_vol = 0.25
+            current_vol = 0.20
         
         # Compute gating weights
         gating_output = self.gating.compute_weights(regime_probs)
         
         # Get signals from all agents
         agent_signals = {}
-        for name, agent in self.agents.items():
-            try:
-                signal = agent.generate_signal(current_data, regime_probs)
-                agent_signals[name] = signal
-            except Exception as e:
-                agent_signals[name] = AgentSignal(action=0, confidence=0, regime_fit=0)
+        for agent_name in gating_output.active_agents:
+            if agent_name in self.agents:
+                signal = self.agents[agent_name].generate_signal(current_data, regime_probs)
+                agent_signals[agent_name] = signal
+                
+                # Track contributions
+                self._agent_activation_count[agent_name] += 1
+                self._agent_contribution_sum[agent_name] += abs(signal.action * signal.confidence)
         
-        # Combine signals with ensemble
+        if not agent_signals:
+            return 0.0, regime_name
+        
+        # Combine via ensemble
         ensemble_output = self.ensemble.combine_signals(
             agent_signals,
             gating_output.weights,
             current_volatility=current_vol
         )
         
-        # Apply meta-controller
+        # Compute position via meta-controller
         controller_output = self.controller.compute_position(
             ensemble_output.final_action,
             ensemble_output.confidence,
@@ -184,348 +149,306 @@ class MoAStrategy:
             regime_probs
         )
         
-        # Execute trade in controller
+        # Execute trade
         if controller_output.is_trade_allowed:
+            prev_pos = self.controller.current_position
             self.controller.execute_trade(controller_output.target_position)
-        
-        # Debug output
-        if self.debug:
-            debug_info = {
-                'date': current_data.index[-1],
-                'regime': regime,
-                'regime_probs': regime_probs,
-                'active_agents': gating_output.active_agents,
-                'agent_weights': gating_output.weights,
-                'ensemble_action': ensemble_output.final_action,
-                'is_conflicting': ensemble_output.is_conflicting,
-                'conflict_penalty': ensemble_output.conflict_penalty,
-                'target_position': controller_output.target_position,
-                'risk_budget': controller_output.risk_budget
-            }
-            self.debug_history.append(debug_info)
             
-            # Print occasionally
-            if len(self.debug_history) % 50 == 0:
-                print(f"    [{current_data.index[-1].strftime('%Y-%m-%d')}] "
-                      f"Regime: {regime}, Pos: {controller_output.target_position:.2f}, "
-                      f"Agents: {gating_output.active_agents}")
+            # Update equity (simplified — actual PnL done by backtest engine)
+            if 'returns' in df.columns and current_idx > 0:
+                daily_ret = df['returns'].iloc[current_idx]
+                if not pd.isna(daily_ret):
+                    portfolio_ret = prev_pos * daily_ret
+                    self.controller.update_equity(portfolio_ret)
         
-        return controller_output.target_position, regime
+        # Debug logging (every 50 bars to reduce noise)
+        if self.debug and current_idx % 50 == 0:
+            date_str = str(df.index[current_idx])[:10]
+            active_str = ', '.join(gating_output.active_agents)
+            
+            # Agent signal details
+            sig_details = []
+            for name, sig in agent_signals.items():
+                w = gating_output.weights.get(name, 0)
+                sig_details.append(f"    {name}: action={sig.action:.3f}, conf={sig.confidence:.2f}, w={w:.2f}")
+            
+            self.debug_log.append({
+                'date': date_str,
+                'regime': regime_name,
+                'position': controller_output.target_position,
+                'agents': active_str,
+                'ensemble_action': ensemble_output.final_action,
+                'confidence': ensemble_output.confidence,
+                'conflict': ensemble_output.is_conflicting,
+                'risk_budget': controller_output.risk_budget,
+            })
+            
+            print(f"    [{date_str}] Regime: {regime_name}, Pos: {controller_output.target_position:.2f}, "
+                  f"Act: {ensemble_output.final_action:.3f}, Conf: {ensemble_output.confidence:.2f}, "
+                  f"Agents: [{active_str}]")
+            for detail in sig_details:
+                print(detail)
+        
+        return controller_output.target_position, regime_name
     
-    def reset(self) -> None:
-        """Reset strategy state for new backtest."""
+    def get_agent_summary(self) -> str:
+        """Print per-agent contribution summary."""
+        lines = ["  Per-Agent Summary:"]
+        for name in self.agents:
+            count = self._agent_activation_count[name]
+            avg_contrib = self._agent_contribution_sum[name] / max(1, count)
+            lines.append(f"    {name}: active {count} bars, avg |action*conf|={avg_contrib:.3f}")
+        return '\n'.join(lines)
+    
+    def reset(self):
+        """Reset for new backtest."""
         self.controller.reset()
-        for agent in self.agents.values():
-            agent.signal_history.clear()
-        self.debug_history.clear()
-
-
-def run_single_ticker_backtest(
-    ticker: str,
-    period: str = '2y',
-    debug: bool = True
-) -> Tuple[BacktestResult, MoAStrategy]:
-    """
-    Run backtest on a single ticker.
-    
-    Args:
-        ticker: Stock ticker symbol
-        period: Historical period to fetch
-        debug: Print debug information
-        
-    Returns:
-        (BacktestResult, strategy)
-    """
-    print(f"\n{'='*60}")
-    print(f"Running backtest for {ticker}")
-    print('='*60)
-    
-    # Load data
-    print(f"  Fetching data...")
-    loader = DataLoader()
-    df = loader.fetch_ticker(ticker, period=period)
-    
-    # Add indicators
-    print(f"  Computing indicators...")
-    df = add_all_indicators(df)
-    
-    # Initialize strategy
-    strategy = MoAStrategy(debug=debug)
-    
-    # Use first portion for training regime detector
-    train_split = int(len(df) * 0.3)
-    train_data = df.iloc[:train_split]
-    strategy.fit(train_data)
-    
-    # Create signal function
-    def signal_func(df, idx):
-        return strategy.generate_signal(df, idx)
-    
-    # Run backtest
-    print(f"  Running backtest...")
-    engine = BacktestEngine()
-    result = engine.run(df, signal_func, warmup_period=train_split)
-    
-    print(f"\n  Results for {ticker}:")
-    print(f"    Total Return:  {result.total_return:>8.2%}")
-    print(f"    Benchmark:     {result.benchmark_return:>8.2%}")
-    print(f"    Alpha:         {result.alpha:>8.2%}")
-    print(f"    Sharpe:        {result.sharpe_ratio:>8.2f}")
-    print(f"    Max Drawdown:  {result.max_drawdown:>8.2%}")
-    print(f"    Num Trades:    {result.num_trades:>8d}")
-    
-    return result, strategy
+        self.debug_log.clear()
+        self._agent_contribution_sum = {name: 0.0 for name in self.agents}
+        self._agent_activation_count = {name: 0 for name in self.agents}
 
 
 def plot_results(
-    ticker: str,
+    ticker: str, 
     result: BacktestResult,
-    save_dir: str = 'Plots/v2'
-) -> None:
-    """
-    Generate and save visualization plots.
-    
-    Args:
-        ticker: Ticker symbol for titles
-        result: Backtest result
-        save_dir: Directory to save plots
-    """
+    save_dir: str = '../Plots'
+):
+    """Generate and save performance plots."""
     os.makedirs(save_dir, exist_ok=True)
     
-    # 1. Portfolio vs Buy & Hold
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, axes = plt.subplots(4, 1, figsize=(14, 16), sharex=True)
+    fig.suptitle(f'V2 MoA Strategy: {ticker}', fontsize=16, fontweight='bold')
     
+    # 1. Portfolio vs Benchmark
+    ax = axes[0]
     ax.plot(result.equity_curve.index, result.equity_curve.values, 
-            label='MoA Strategy', linewidth=2, color='#2196F3')
+            label=f'MoA V2 ({result.total_return:.1%})', linewidth=2, color='#2196F3')
     ax.plot(result.benchmark_curve.index, result.benchmark_curve.values,
-            label='Buy & Hold', linewidth=2, color='#9E9E9E', linestyle='--')
-    
-    ax.fill_between(result.equity_curve.index, 
-                    result.equity_curve.values, 
-                    result.benchmark_curve.values,
-                    where=result.equity_curve.values >= result.benchmark_curve.values,
-                    alpha=0.3, color='green', label='Outperformance')
-    ax.fill_between(result.equity_curve.index,
-                    result.equity_curve.values,
-                    result.benchmark_curve.values,
-                    where=result.equity_curve.values < result.benchmark_curve.values,
-                    alpha=0.3, color='red', label='Underperformance')
-    
-    ax.set_title(f'{ticker}: MoA Strategy vs Buy & Hold', fontsize=14, fontweight='bold')
-    ax.set_xlabel('Date')
-    ax.set_ylabel('Portfolio Value ($)')
+            label=f'Buy & Hold ({result.benchmark_return:.1%})', linewidth=1.5, 
+            color='#FF9800', linestyle='--')
+    ax.set_ylabel('Portfolio Value')
     ax.legend(loc='upper left')
+    ax.set_title('Equity Curve')
     ax.grid(True, alpha=0.3)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    
-    plt.savefig(f'{save_dir}/{ticker}_portfolio_vs_buyhold.png', dpi=150)
-    plt.close()
     
     # 2. Drawdown
-    fig, ax = plt.subplots(figsize=(12, 4))
-    
-    ax.fill_between(result.drawdown_curve.index, 0, result.drawdown_curve.values * 100,
-                    color='red', alpha=0.5)
-    ax.axhline(y=-result.max_drawdown * 100, color='darkred', linestyle='--',
-               label=f'Max DD: {result.max_drawdown:.1%}')
-    
-    ax.set_title(f'{ticker}: Drawdown', fontsize=14, fontweight='bold')
-    ax.set_xlabel('Date')
-    ax.set_ylabel('Drawdown (%)')
-    ax.legend()
+    ax = axes[1]
+    ax.fill_between(result.drawdown_curve.index, 0, result.drawdown_curve.values,
+                     color='#F44336', alpha=0.4)
+    ax.set_ylabel('Drawdown')
+    ax.set_title(f'Drawdown (Max: {result.max_drawdown:.1%})')
     ax.grid(True, alpha=0.3)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    
-    plt.savefig(f'{save_dir}/{ticker}_drawdown.png', dpi=150)
-    plt.close()
     
     # 3. Position History
-    fig, ax = plt.subplots(figsize=(12, 4))
-    
+    ax = axes[2]
     ax.fill_between(result.position_history.index, 0, result.position_history.values,
-                    where=result.position_history.values >= 0,
-                    color='green', alpha=0.5, label='Long')
+                     where=result.position_history >= 0, color='#4CAF50', alpha=0.5, label='Long')
     ax.fill_between(result.position_history.index, 0, result.position_history.values,
-                    where=result.position_history.values < 0,
-                    color='red', alpha=0.5, label='Short')
+                     where=result.position_history < 0, color='#F44336', alpha=0.5, label='Short')
+    ax.set_ylabel('Position (%)')
+    ax.set_title('Position History')
+    ax.legend(loc='upper right')
+    ax.grid(True, alpha=0.3)
     ax.axhline(y=0, color='black', linewidth=0.5)
     
-    ax.set_title(f'{ticker}: Position History', fontsize=14, fontweight='bold')
-    ax.set_xlabel('Date')
-    ax.set_ylabel('Position (% of Capital)')
-    ax.set_ylim(-1.1, 1.1)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    plt.xticks(rotation=45)
+    # 4. Regime
+    ax = axes[3]
+    regime_colors = {
+        'Growth': '#4CAF50',
+        'Stagnation': '#9E9E9E',
+        'Transition': '#FF9800',
+        'Crisis': '#F44336',
+        'Unknown': '#BDBDBD'
+    }
+    regime_numeric = result.regime_history.map({
+        'Growth': 3, 'Stagnation': 1, 'Transition': 2, 'Crisis': 0, 'Unknown': -1
+    })
+    
+    for regime_name, color in regime_colors.items():
+        mask = result.regime_history == regime_name
+        if mask.any():
+            ax.fill_between(result.regime_history.index, 0, 1,
+                           where=mask, color=color, alpha=0.4, label=regime_name)
+    
+    ax.set_ylabel('Regime')
+    ax.set_title('Regime History')
+    ax.legend(loc='upper right', ncol=4)
+    ax.set_yticks([])
+    
     plt.tight_layout()
-    
-    plt.savefig(f'{save_dir}/{ticker}_positions.png', dpi=150)
+    plt.savefig(os.path.join(save_dir, f'v2_{ticker}_performance.png'), dpi=150, bbox_inches='tight')
     plt.close()
+
+
+def plot_summary(all_results: Dict[str, BacktestResult], save_dir: str = '../Plots'):
+    """Generate summary comparison plot."""
+    os.makedirs(save_dir, exist_ok=True)
     
-    # 4. Regime History
-    if len(result.regime_history) > 0:
-        fig, ax = plt.subplots(figsize=(12, 3))
-        
-        regime_colors = {
-            'Growth': 'green',
-            'Stagnation': 'gray',
-            'Transition': 'orange',
-            'Crisis': 'red',
-            'Unknown': 'blue',
-            'Warmup': 'lightgray',
-            'Error': 'black'
-        }
-        
-        regime_nums = {'Growth': 3, 'Stagnation': 2, 'Transition': 1, 'Crisis': 0,
-                       'Unknown': -1, 'Warmup': -1, 'Error': -1}
-        
-        colors = [regime_colors.get(r, 'blue') for r in result.regime_history.values]
-        nums = [regime_nums.get(r, -1) for r in result.regime_history.values]
-        
-        ax.scatter(result.regime_history.index, nums, c=colors, s=5, alpha=0.6)
-        ax.set_yticks([0, 1, 2, 3])
-        ax.set_yticklabels(['Crisis', 'Transition', 'Stagnation', 'Growth'])
-        
-        ax.set_title(f'{ticker}: Detected Regimes', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Date')
-        ax.grid(True, alpha=0.3)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        
-        plt.savefig(f'{save_dir}/{ticker}_regimes.png', dpi=150)
-        plt.close()
+    tickers = list(all_results.keys())
+    strategy_returns = [all_results[t].total_return * 100 for t in tickers]
+    benchmark_returns = [all_results[t].benchmark_return * 100 for t in tickers]
+    alphas = [all_results[t].alpha * 100 for t in tickers]
+    sharpes = [all_results[t].sharpe_ratio for t in tickers]
     
-    print(f"  Plots saved to {save_dir}/")
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle('V2 MoA Framework — Benchmark Summary', fontsize=16, fontweight='bold')
+    
+    # Returns comparison
+    ax = axes[0]
+    x = np.arange(len(tickers))
+    width = 0.35
+    ax.bar(x - width/2, strategy_returns, width, label='MoA V2', color='#2196F3')
+    ax.bar(x + width/2, benchmark_returns, width, label='Buy & Hold', color='#FF9800')
+    ax.set_xlabel('Ticker')
+    ax.set_ylabel('Total Return (%)')
+    ax.set_title('Returns')
+    ax.set_xticks(x)
+    ax.set_xticklabels(tickers)
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # Alpha
+    ax = axes[1]
+    colors = ['#4CAF50' if a >= 0 else '#F44336' for a in alphas]
+    ax.bar(tickers, alphas, color=colors)
+    ax.set_ylabel('Alpha (%)')
+    ax.set_title('Alpha')
+    ax.axhline(y=0, color='black', linewidth=0.5)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # Sharpe
+    ax = axes[2]
+    colors = ['#4CAF50' if s >= 0 else '#F44336' for s in sharpes]
+    ax.bar(tickers, sharpes, color=colors)
+    ax.set_ylabel('Sharpe Ratio')
+    ax.set_title('Sharpe Ratio')
+    ax.axhline(y=0, color='black', linewidth=0.5)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'v2_benchmark_summary.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def run_single_backtest(
+    ticker: str,
+    period: str = '2y',
+    debug: bool = True
+) -> Optional[BacktestResult]:
+    """Run backtest for a single ticker."""
+    
+    print(f"\n{'='*60}")
+    print(f"Running V2 backtest for {ticker}")
+    print(f"{'='*60}")
+    
+    loader = DataLoader()
+    
+    # Fetch data
+    print("  Fetching data...")
+    try:
+        df = loader.fetch_ticker(ticker, period=period)
+    except Exception as e:
+        print(f"  ERROR fetching {ticker}: {e}")
+        return None
+    
+    # Compute indicators
+    print("  Computing indicators...")
+    df = add_all_indicators(df)
+    
+    # Create strategy
+    strategy = MoAStrategyV2(debug=debug)
+    
+    # Train regime detector
+    print("  Training regime detector...")
+    strategy.regime_detector.fit(df)
+    
+    # Run backtest
+    print("  Running backtest...")
+    engine = BacktestEngine(transaction_cost=0.001)
+    
+    try:
+        result = engine.run(df, strategy.generate_signal, warmup_period=60)
+    except Exception as e:
+        print(f"  ERROR during backtest: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    
+    # Print results
+    print(f"\n  Results for {ticker}:")
+    print(f"    Total Return:   {result.total_return:>8.2%}")
+    print(f"    Benchmark:      {result.benchmark_return:>8.2%}")
+    print(f"    Alpha:          {result.alpha:>8.2%}")
+    print(f"    Sharpe:         {result.sharpe_ratio:>8.2f}")
+    print(f"    Max Drawdown:   {result.max_drawdown:>8.2%}")
+    print(f"    Num Trades:     {result.num_trades:>8d}")
+    
+    # Agent contribution summary
+    print(strategy.get_agent_summary())
+    
+    # Plot
+    plot_results(ticker, result)
+    print(f"  Plots saved to Plots/")
+    
+    return result
 
 
 def run_full_benchmark(
     tickers: Optional[List[str]] = None,
     period: str = '2y',
-    save_plots: bool = True
-) -> pd.DataFrame:
-    """
-    Run benchmark on multiple tickers.
+    debug: bool = True
+):
+    """Run full benchmark across all tickers."""
     
-    Args:
-        tickers: List of tickers (default: tech tickers)
-        period: Historical period
-        save_plots: Whether to save visualization plots
-        
-    Returns:
-        DataFrame with results summary
-    """
     if tickers is None:
         tickers = get_benchmark_tickers()
     
-    print("\n" + "="*60)
-    print("MoA Trading Framework - Full Benchmark")
-    print("="*60)
+    print(f"\n{'='*60}")
+    print(f"MoA V2 Trading Framework — Full Benchmark")
+    print(f"{'='*60}")
     print(f"Tickers: {tickers}")
     print(f"Period: {period}")
-    print("="*60)
+    print(f"{'='*60}")
     
-    results = []
+    all_results = {}
     
     for ticker in tickers:
-        try:
-            result, strategy = run_single_ticker_backtest(ticker, period, debug=True)
-            
-            if save_plots:
-                plot_results(ticker, result)
-            
-            results.append({
-                'Ticker': ticker,
-                'Total Return': result.total_return,
-                'Benchmark Return': result.benchmark_return,
-                'Alpha': result.alpha,
-                'Sharpe': result.sharpe_ratio,
-                'Sortino': result.sortino_ratio,
-                'Max Drawdown': result.max_drawdown,
-                'Calmar': result.calmar_ratio,
-                'Num Trades': result.num_trades,
-                'Win Rate': result.win_rate
-            })
-            
-        except Exception as e:
-            print(f"  ERROR processing {ticker}: {e}")
-            import traceback
-            traceback.print_exc()
+        result = run_single_backtest(ticker, period, debug)
+        if result is not None:
+            all_results[ticker] = result
     
-    # Create summary DataFrame
-    summary_df = pd.DataFrame(results)
+    # Summary
+    if all_results:
+        print(f"\n{'='*60}")
+        print(f"V2 BENCHMARK SUMMARY")
+        print(f"{'='*60}")
+        
+        print(f"{'Ticker':>6}  {'Total Return':>12}  {'Benchmark':>12}  {'Alpha':>8}  {'Sharpe':>8}  "
+              f"{'Sortino':>8}  {'Max DD':>8}  {'Calmar':>8}  {'Trades':>8}  {'Win Rate':>8}")
+        
+        for ticker, r in all_results.items():
+            print(f"{ticker:>6}  {r.total_return:>12.4%}  {r.benchmark_return:>12.4%}  "
+                  f"{r.alpha:>8.4%}  {r.sharpe_ratio:>8.2f}  {r.sortino_ratio:>8.2f}  "
+                  f"{r.max_drawdown:>8.4%}  {r.calmar_ratio:>8.2f}  "
+                  f"{r.num_trades:>8d}  {r.win_rate:>8.2%}")
+        
+        # Averages
+        avg_alpha = np.mean([r.alpha for r in all_results.values()])
+        avg_sharpe = np.mean([r.sharpe_ratio for r in all_results.values()])
+        avg_dd = np.mean([r.max_drawdown for r in all_results.values()])
+        
+        print(f"\n{'-'*60}")
+        print(f"AVERAGES:")
+        print(f"  Avg Alpha:           {avg_alpha:.2%}")
+        print(f"  Avg Sharpe:          {avg_sharpe:.2f}")
+        print(f"  Avg Max Drawdown:    {avg_dd:.2%}")
+        
+        # Summary plot
+        plot_summary(all_results)
+        print(f"\n  Summary plot saved to Plots/v2_benchmark_summary.png")
     
-    # Print summary
-    print("\n" + "="*60)
-    print("BENCHMARK SUMMARY")
-    print("="*60)
-    print(summary_df.to_string(index=False))
-    
-    # Calculate averages
-    if len(summary_df) > 0:
-        print("\n" + "-"*60)
-        print("AVERAGES:")
-        print(f"  Avg Alpha:        {summary_df['Alpha'].mean():>8.2%}")
-        print(f"  Avg Sharpe:       {summary_df['Sharpe'].mean():>8.2f}")
-        print(f"  Avg Max Drawdown: {summary_df['Max Drawdown'].mean():>8.2%}")
-    
-    # Save summary plot
-    if save_plots and len(summary_df) > 0:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        
-        # Returns comparison
-        ax = axes[0, 0]
-        x = np.arange(len(summary_df))
-        width = 0.35
-        ax.bar(x - width/2, summary_df['Total Return'] * 100, width, label='Strategy', color='#2196F3')
-        ax.bar(x + width/2, summary_df['Benchmark Return'] * 100, width, label='Buy & Hold', color='#9E9E9E')
-        ax.set_xticks(x)
-        ax.set_xticklabels(summary_df['Ticker'])
-        ax.set_ylabel('Return (%)')
-        ax.set_title('Returns: Strategy vs Benchmark')
-        ax.legend()
-        ax.axhline(y=0, color='black', linewidth=0.5)
-        ax.grid(True, alpha=0.3, axis='y')
-        
-        # Alpha
-        ax = axes[0, 1]
-        colors = ['green' if a > 0 else 'red' for a in summary_df['Alpha']]
-        ax.bar(summary_df['Ticker'], summary_df['Alpha'] * 100, color=colors, alpha=0.7)
-        ax.set_ylabel('Alpha (%)')
-        ax.set_title('Alpha (vs Buy & Hold)')
-        ax.axhline(y=0, color='black', linewidth=0.5)
-        ax.grid(True, alpha=0.3, axis='y')
-        
-        # Sharpe
-        ax = axes[1, 0]
-        ax.bar(summary_df['Ticker'], summary_df['Sharpe'], color='#673AB7', alpha=0.7)
-        ax.set_ylabel('Sharpe Ratio')
-        ax.set_title('Sharpe Ratio')
-        ax.axhline(y=0, color='black', linewidth=0.5)
-        ax.axhline(y=1.0, color='green', linestyle='--', alpha=0.5, label='Good (>1)')
-        ax.grid(True, alpha=0.3, axis='y')
-        
-        # Max Drawdown
-        ax = axes[1, 1]
-        ax.bar(summary_df['Ticker'], summary_df['Max Drawdown'] * 100, color='#F44336', alpha=0.7)
-        ax.set_ylabel('Max Drawdown (%)')
-        ax.set_title('Maximum Drawdown')
-        ax.grid(True, alpha=0.3, axis='y')
-        
-        plt.tight_layout()
-        plt.savefig('Plots/benchmark_summary.png', dpi=150)
-        plt.close()
-        
-        print("\n  Summary plot saved to Plots/benchmark_summary.png")
-    
-    return summary_df
+    return all_results
 
 
-if __name__ == "__main__":
-    # Run the full benchmark
-    summary = run_full_benchmark()
+if __name__ == '__main__':
+    results = run_full_benchmark()

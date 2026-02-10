@@ -1,25 +1,22 @@
 """
-Gating Network Module for MoA Trading Framework
-Implements Top-K sparse gating to select the most relevant agents.
+V2 MoA Gating Network
+Redesigned to support 5 agents with Top-K=3 selection.
+
+Key V2 improvements over V1:
+- 5 agents (added ExponentialMomentumAgent)  
+- Top-K=3 allows momentum agent to coexist with trend agent
+- Updated affinity matrix: ExponentialMomentumAgent has highest Growth affinity
+- Avoids selecting conflicting agents (Trend + MeanReversion during Growth)
 """
 
 import numpy as np
-import pandas as pd
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
 
 @dataclass
 class GatingOutput:
-    """
-    Output from the gating network.
-    
-    Attributes:
-        weights: Dictionary of agent_name -> weight (only active agents included)
-        active_agents: List of agent names that were selected
-        regime_probs: Current regime probability distribution
-        conflict_score: Estimated conflict between selected agents
-    """
+    """Output from the gating network."""
     weights: Dict[str, float]
     active_agents: List[str]
     regime_probs: Dict[str, float]
@@ -28,25 +25,9 @@ class GatingOutput:
 
 class MoAGatingNetwork:
     """
-    Gating Network for Mixture of Agents.
-    
-    Maps regime probabilities to agent weights using:
-    - Regime-agent affinity matrix
-    - Top-K sparse selection
-    - Temperature-controlled sharpness
+    V2 Gating Network with 5-agent support and Top-K=3 selection.
     """
     
-    # Default regime-agent affinity matrix
-    # Rows: regimes (Growth, Stagnation, Transition, Crisis)
-    # Columns: agents (Trend, MeanReversion, Volatility, Crisis)
-    DEFAULT_AFFINITY = np.array([
-        [0.6, 0.2, 0.1, 0.0, 0.9],   # Growth: Trend + ExpMom
-        [0.1, 0.7, 0.2, 0.0, 0.0],   # Stagnation: mostly MeanReversion
-        [0.2, 0.1, 0.6, 0.1, 0.0],   # Transition: mostly Volatility
-        [0.4, 0.0, 0.1, 0.5, 0.0],   # Crisis: Trend + Crisis
-    ])
-    
-    REGIME_NAMES = ['Growth', 'Stagnation', 'Transition', 'Crisis']
     AGENT_NAMES = [
         'TrendAgent', 
         'MeanReversionAgent', 
@@ -55,158 +36,99 @@ class MoAGatingNetwork:
         'ExponentialMomentumAgent'
     ]
     
+    REGIME_NAMES = ['Growth', 'Stagnation', 'Transition', 'Crisis']
+    
     def __init__(
         self,
-        top_k: int = 2,
-        temperature: float = 1.0,
-        min_weight: float = 0.1,
-        affinity_matrix: Optional[np.ndarray] = None
+        top_k: int = 3,
+        temperature: float = 0.8,
     ):
-        """
-        Initialize the gating network.
-        
-        Args:
-            top_k: Number of top agents to select
-            temperature: Temperature for softmax (lower = sharper selection)
-            min_weight: Minimum weight for selected agents
-            affinity_matrix: Custom regime-agent affinity matrix
-        """
         self.top_k = top_k
         self.temperature = temperature
-        self.min_weight = min_weight
         
-        if affinity_matrix is not None:
-            self.affinity = affinity_matrix
-        else:
-            self.affinity = self.DEFAULT_AFFINITY.copy()
-    
-    def _softmax(self, x: np.ndarray, temperature: float = 1.0) -> np.ndarray:
-        """Compute softmax with temperature."""
-        x = x / temperature
-        exp_x = np.exp(x - np.max(x))
-        return exp_x / exp_x.sum()
+        # V2 Affinity Matrix: 5 agents x 4 regimes
+        # Rows: agents, Columns: Growth, Stagnation, Transition, Crisis
+        self.affinity_matrix = np.array([
+            # Growth  Stag  Trans  Crisis
+            [0.80,   0.20,  0.40,  0.60],  # TrendAgent
+            [0.10,   0.90,  0.30,  0.05],  # MeanReversionAgent
+            [0.30,   0.30,  0.85,  0.20],  # VolatilityAgent
+            [0.10,   0.05,  0.20,  0.90],  # CrisisAgent
+            [0.95,   0.15,  0.50,  0.40],  # ExponentialMomentumAgent (new)
+        ])
     
     def _compute_raw_weights(self, regime_probs: Dict[str, float]) -> np.ndarray:
-        """
-        Compute raw agent weights from regime probabilities.
-        
-        weights = A^T @ regime_probs
-        where A is the affinity matrix.
-        """
-        # Convert regime probs to array
-        regime_vec = np.array([
-            regime_probs.get('Growth', 0.25),
-            regime_probs.get('Stagnation', 0.25),
-            regime_probs.get('Transition', 0.25),
-            regime_probs.get('Crisis', 0.25),
+        """Compute raw agent weights from regime probabilities."""
+        prob_vector = np.array([
+            regime_probs.get(r, 0) for r in self.REGIME_NAMES
         ])
         
-        # Matrix multiply: (4 agents) = (4 regimes x 4 agents)^T @ (4 regimes)
-        raw_weights = self.affinity.T @ regime_vec
-        
+        raw_weights = self.affinity_matrix @ prob_vector
         return raw_weights
     
+    def _softmax(self, x: np.ndarray, temperature: float) -> np.ndarray:
+        """Temperature-scaled softmax."""
+        x_scaled = x / max(temperature, 0.01)
+        exp_x = np.exp(x_scaled - np.max(x_scaled))
+        return exp_x / exp_x.sum()
+    
     def _apply_top_k(self, weights: np.ndarray) -> Tuple[np.ndarray, List[int]]:
-        """
-        Apply Top-K selection.
+        """Select top-K agents and renormalize."""
+        k = min(self.top_k, len(weights))
+        top_indices = np.argsort(weights)[-k:]
         
-        Returns:
-            (sparse_weights, selected_indices)
-        """
-        # Get top-k indices
-        top_indices = np.argsort(weights)[-self.top_k:]
-        
-        # Create sparse weights
         sparse_weights = np.zeros_like(weights)
         sparse_weights[top_indices] = weights[top_indices]
         
-        # Renormalize
-        if sparse_weights.sum() > 0:
-            sparse_weights = sparse_weights / sparse_weights.sum()
+        total = sparse_weights.sum()
+        if total > 0:
+            sparse_weights /= total
         
-        # Enforce minimum weight
-        for i in top_indices:
-            if sparse_weights[i] < self.min_weight and sparse_weights[i] > 0:
-                sparse_weights[i] = self.min_weight
-        
-        # Renormalize again
-        if sparse_weights.sum() > 0:
-            sparse_weights = sparse_weights / sparse_weights.sum()
-        
-        return sparse_weights, list(top_indices)
+        return sparse_weights, sorted(top_indices.tolist())
     
     def _estimate_conflict(
         self, 
-        selected_indices: List[int], 
+        selected_indices: List[int],
         regime_probs: Dict[str, float]
     ) -> float:
-        """
-        Estimate potential conflict between selected agents.
-        
-        Higher conflict when agents favor opposite strategies.
-        """
+        """Estimate conflict between selected agents."""
         if len(selected_indices) < 2:
             return 0.0
         
-        # Define conflicting pairs (index pairs)
-        conflicts = [
-            (0, 1),  # Trend vs MeanReversion
-            (2, 3),  # Volatility vs Crisis (both defensive but different)
-            (4, 1),  # ExpMom vs MeanReversion
-            (4, 3),  # ExpMom vs Crisis
-        ]
+        affinities = self.affinity_matrix[selected_indices]
         
-        conflict_score = 0.0
-        for i, j in conflicts:
-            if i in selected_indices and j in selected_indices:
-                # Both conflicting agents are selected
-                conflict_score += 0.3
+        # Calculate pairwise cosine distance
+        conflicts = []
+        for i in range(len(affinities)):
+            for j in range(i + 1, len(affinities)):
+                dot = np.dot(affinities[i], affinities[j])
+                norm_i = np.linalg.norm(affinities[i])
+                norm_j = np.linalg.norm(affinities[j])
+                if norm_i > 0 and norm_j > 0:
+                    similarity = dot / (norm_i * norm_j)
+                    conflicts.append(1 - similarity)
         
-        # Additional conflict if regime probabilities are uncertain
-        regime_vec = np.array([
-            regime_probs.get('Growth', 0.25),
-            regime_probs.get('Stagnation', 0.25),
-            regime_probs.get('Transition', 0.25),
-            regime_probs.get('Crisis', 0.25),
-        ])
-        
-        # High entropy = high uncertainty
-        entropy = -np.sum(regime_vec * np.log(regime_vec + 1e-8))
-        max_entropy = np.log(4)  # Maximum entropy for 4 classes
-        normalized_entropy = entropy / max_entropy
-        
-        conflict_score += normalized_entropy * 0.3
-        
-        return min(1.0, conflict_score)
+        return np.mean(conflicts) if conflicts else 0.0
     
     def compute_weights(self, regime_probs: Dict[str, float]) -> GatingOutput:
         """
         Compute agent weights from regime probabilities.
         
-        Args:
-            regime_probs: Dictionary with P(Growth), P(Stagnation), etc.
-            
         Returns:
-            GatingOutput with weights, active agents, and conflict score
+            GatingOutput with sparse weights for top-K agents
         """
-        # Compute raw weights
         raw_weights = self._compute_raw_weights(regime_probs)
-        
-        # Apply softmax with temperature
         soft_weights = self._softmax(raw_weights, self.temperature)
-        
-        # Apply Top-K selection
         sparse_weights, selected_indices = self._apply_top_k(soft_weights)
         
-        # Convert to dictionary
         weights_dict = {}
         active_agents = []
-        for i, agent_name in enumerate(self.AGENT_NAMES):
-            if sparse_weights[i] > 0:
-                weights_dict[agent_name] = sparse_weights[i]
-                active_agents.append(agent_name)
+        for idx in selected_indices:
+            if sparse_weights[idx] > 0:
+                name = self.AGENT_NAMES[idx]
+                weights_dict[name] = float(sparse_weights[idx])
+                active_agents.append(name)
         
-        # Estimate conflict
         conflict_score = self._estimate_conflict(selected_indices, regime_probs)
         
         return GatingOutput(
@@ -215,54 +137,3 @@ class MoAGatingNetwork:
             regime_probs=regime_probs,
             conflict_score=conflict_score
         )
-    
-    def update_affinity(self, performance_feedback: Dict[str, float]) -> None:
-        """
-        Update affinity matrix based on performance feedback.
-        
-        This enables online learning of regime-agent mappings.
-        
-        Args:
-            performance_feedback: Dictionary of agent_name -> recent performance
-        """
-        # Simple exponential moving average update
-        learning_rate = 0.1
-        
-        for i, agent_name in enumerate(self.AGENT_NAMES):
-            if agent_name in performance_feedback:
-                perf = performance_feedback[agent_name]
-                
-                # Boost affinity for good-performing agents
-                if perf > 0:
-                    self.affinity[:, i] *= (1 + learning_rate * perf)
-                else:
-                    self.affinity[:, i] *= (1 + learning_rate * perf)  # Reduce
-        
-        # Renormalize rows
-        for i in range(self.affinity.shape[0]):
-            self.affinity[i] = self.affinity[i] / self.affinity[i].sum()
-
-
-if __name__ == "__main__":
-    # Test the gating network
-    gating = MoAGatingNetwork(top_k=2)
-    
-    # Test with different regime scenarios
-    scenarios = [
-        {"Growth": 0.8, "Stagnation": 0.1, "Transition": 0.05, "Crisis": 0.05},
-        {"Growth": 0.1, "Stagnation": 0.7, "Transition": 0.15, "Crisis": 0.05},
-        {"Growth": 0.1, "Stagnation": 0.1, "Transition": 0.7, "Crisis": 0.1},
-        {"Growth": 0.1, "Stagnation": 0.05, "Transition": 0.1, "Crisis": 0.75},
-        {"Growth": 0.25, "Stagnation": 0.25, "Transition": 0.25, "Crisis": 0.25},  # Uncertain
-    ]
-    
-    print("Gating Network Tests:")
-    print("=" * 60)
-    
-    for i, regime_probs in enumerate(scenarios):
-        output = gating.compute_weights(regime_probs)
-        dominant = max(regime_probs, key=regime_probs.get)
-        print(f"\nScenario {i+1}: Dominant regime = {dominant}")
-        print(f"  Active Agents: {output.active_agents}")
-        print(f"  Weights: {output.weights}")
-        print(f"  Conflict Score: {output.conflict_score:.3f}")
