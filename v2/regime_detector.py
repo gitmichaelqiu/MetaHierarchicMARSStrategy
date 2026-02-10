@@ -67,6 +67,7 @@ class RegimeDetector:
         - Rolling skewness
         - Rolling kurtosis
         - Volatility trend (vol change)
+        - Efficiency (Return / Vol)
         """
         features = pd.DataFrame(index=df.index)
         
@@ -75,8 +76,11 @@ class RegimeDetector:
             df['returns'] = df['close'].pct_change()
         
         # Rolling features
-        features['rolling_return'] = df['returns'].rolling(self.lookback).mean()
-        features['rolling_vol'] = df['returns'].rolling(self.lookback).std() * np.sqrt(252)
+        rolling_return = df['returns'].rolling(self.lookback).mean()
+        rolling_vol = df['returns'].rolling(self.lookback).std() * np.sqrt(252)
+        
+        features['rolling_return'] = rolling_return
+        features['rolling_vol'] = rolling_vol
         features['rolling_skew'] = df['returns'].rolling(self.lookback).skew()
         features['rolling_kurt'] = df['returns'].rolling(self.lookback).kurt()
         
@@ -87,6 +91,10 @@ class RegimeDetector:
         sma_50 = df['close'].rolling(50).mean()
         features['price_vs_sma'] = (df['close'] - sma_50) / sma_50
         
+        # Efficiency (Sortino-like proxy: Return / Vol)
+        # Add epsilon to avoid div by zero
+        features['efficiency'] = rolling_return / (rolling_vol + 1e-6)
+        
         # Drop NaN rows
         features = features.dropna()
         
@@ -94,65 +102,65 @@ class RegimeDetector:
     
     def _assign_regime_labels(self, features: pd.DataFrame) -> None:
         """
-        Assign semantic meaning to GMM cluster labels.
-        Based on cluster characteristics:
-        - Growth: High return, low-medium vol
-        - Crisis: Negative return, high vol, negative skew
-        - Transition: High vol change, high kurtosis
-        - Stagnation: Low return, low vol
+        Assign semantic meaning to GMM cluster labels using Relative Ranking.
+        
+        Robust Logic:
+        1. Cluster with Highest Return -> Growth
+        2. Cluster with Lowest Return -> Crisis
+        3. Of remaining, Cluster with Lowest Volatility -> Stagnation
+        4. Last remaining -> Transition
         """
-        # Get cluster centers
+        # Get cluster centers - unscaled for easier interpretation
         centers = pd.DataFrame(
             self.scaler.inverse_transform(self.model.means_),
             columns=features.columns
         )
         
-        # Score each cluster for each regime type
-        regime_scores = np.zeros((self.n_regimes, 4))  # clusters x regime_types
-        
-        for i in range(self.n_regimes):
-            ret = centers.iloc[i]['rolling_return']
-            vol = centers.iloc[i]['rolling_vol']
-            skew = centers.iloc[i]['rolling_skew']
-            vol_change = centers.iloc[i]['vol_change']
-            
-            # Growth score: high return, moderate vol
-            regime_scores[i, self.GROWTH] = ret * 3 - abs(vol - 0.15)
-            
-            # Stagnation score: low abs return, low vol
-            regime_scores[i, self.STAGNATION] = -abs(ret) * 2 - vol
-            
-            # Transition score: high vol change, high vol
-            regime_scores[i, self.TRANSITION] = abs(vol_change) * 2 + vol
-            
-            # Crisis score: negative return, high vol, negative skew
-            regime_scores[i, self.CRISIS] = -ret * 3 + vol - skew
-        
-        # Assign each cluster to highest-scoring regime
-        # First pass: assign greedily
-        used_regimes = set()
         self.regime_mapping = {}
+        available_clusters = set(range(self.n_regimes))
         
-        for _ in range(self.n_regimes):
-            # Find best unassigned cluster-regime pair
-            best_score = -np.inf
-            best_cluster = -1
-            best_regime = -1
+        # 1. Identify Growth (Highest Return)
+        # Check: Growth must have positive return
+        growth_candidates = centers[centers['rolling_return'] > 0.0001]
+        if not growth_candidates.empty:
+            growth_cluster = growth_candidates['rolling_return'].idxmax()
+        else:
+            # No real growth, take best available but treat as Stagnation or Transition if weak
+            growth_cluster = centers['rolling_return'].idxmax()
             
-            for cluster in range(self.n_regimes):
-                if cluster in self.regime_mapping:
-                    continue
-                for regime in range(4):
-                    if regime in used_regimes:
-                        continue
-                    if regime_scores[cluster, regime] > best_score:
-                        best_score = regime_scores[cluster, regime]
-                        best_cluster = cluster
-                        best_regime = regime
+        self.regime_mapping[growth_cluster] = self.GROWTH
+        available_clusters.remove(growth_cluster)
+        
+        # 2. Identify Crisis (Lowest Return)
+        # Check: Crisis must have negative return
+        if available_clusters:
+            remaining_centers = centers.loc[list(available_clusters)]
+            min_ret_cluster = remaining_centers['rolling_return'].idxmin()
             
-            if best_cluster >= 0:
-                self.regime_mapping[best_cluster] = best_regime
-                used_regimes.add(best_regime)
+            if centers.loc[min_ret_cluster, 'rolling_return'] < -0.0002: # -0.02% daily ~ -5% annualized
+                self.regime_mapping[min_ret_cluster] = self.CRISIS
+                available_clusters.remove(min_ret_cluster)
+            else:
+                # Lowest return is not negative enough for Crisis
+                # Map to Stagnation or Transition later
+                pass
+        
+        # 3. Identify Stagnation (Lowest Volatility) from remaining
+        if available_clusters:
+            vol_score = centers['rolling_vol'].loc[list(available_clusters)]
+            stagnation_cluster = vol_score.idxmin()
+            self.regime_mapping[stagnation_cluster] = self.STAGNATION
+            available_clusters.remove(stagnation_cluster)
+        
+        # 4. Remaining is Transition
+        if available_clusters:
+            for c in available_clusters:
+                self.regime_mapping[c] = self.TRANSITION
+            
+        # Fallback/Safety: If n_regimes > 4, map others to Transition
+        for i in range(self.n_regimes):
+            if i not in self.regime_mapping:
+                self.regime_mapping[i] = self.TRANSITION
     
     def fit(self, df: pd.DataFrame) -> 'RegimeDetector':
         """

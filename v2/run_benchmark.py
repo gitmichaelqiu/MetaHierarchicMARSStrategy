@@ -21,7 +21,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_loader import DataLoader, get_benchmark_tickers
 from indicators import add_all_indicators
 from regime_detector import RegimeDetector, add_regime_features
-from agents import TrendAgent, MeanReversionAgent, VolatilityAgent, CrisisAgent, AgentSignal
+from agents import TrendAgent, MeanReversionAgent, VolatilityAgent, CrisisAgent, ExponentialMomentumAgent, AgentSignal
 from moa_gating import MoAGatingNetwork
 from moa_ensemble import MoASoftEnsemble
 from meta_controller import MetaController
@@ -47,6 +47,8 @@ class MoAStrategy:
         conflict_threshold: float = 0.6,  # Higher threshold - less penalty
         transaction_cost: float = 0.001,
         kelly_fraction: float = 1.0,  # Full Kelly for more aggressive sizing
+        retrain_freq: int = 60,
+        train_window: int = 252,
         debug: bool = True
     ):
         """
@@ -69,7 +71,8 @@ class MoAStrategy:
             'TrendAgent': TrendAgent(),
             'MeanReversionAgent': MeanReversionAgent(),
             'VolatilityAgent': VolatilityAgent(),
-            'CrisisAgent': CrisisAgent()
+            'CrisisAgent': CrisisAgent(),
+            'ExponentialMomentumAgent': ExponentialMomentumAgent()
         }
         
         self.gating = MoAGatingNetwork(
@@ -83,8 +86,13 @@ class MoAStrategy:
         
         # Use defaults from MetaController for more aggressive positioning
         self.controller = MetaController(
-            transaction_cost=transaction_cost
+            transaction_cost=transaction_cost,
+            max_position=2.0  # Allow leverage
         )
+        
+        self.retrain_freq = retrain_freq
+        self.train_window = train_window
+        self.last_train_idx = 0
         
         # State
         self.is_fitted = False
@@ -95,6 +103,7 @@ class MoAStrategy:
         print("  Training regime detector...")
         self.regime_detector.fit(df)
         self.is_fitted = True
+        self.last_train_idx = len(df)
         return self
     
     def generate_signal(self, df: pd.DataFrame, current_idx: int) -> Tuple[float, str]:
@@ -116,6 +125,23 @@ class MoAStrategy:
         
         if len(current_data) < 50:
             return 0.0, 'Warmup'
+            
+        # Check for retraining
+        if self.is_fitted and (current_idx - self.last_train_idx >= self.retrain_freq):
+            # Retrain on rolling window
+            train_start = max(0, current_idx - self.train_window)
+            train_data = df.iloc[train_start:current_idx]
+            
+            # Ensure we have enough data and volatility isn't zero
+            if len(train_data) > 100:
+                try:
+                    self.regime_detector.fit(train_data)
+                    self.last_train_idx = current_idx
+                    if self.debug:
+                        print(f"    [Retrained Regime Detector at idx {current_idx}]")
+                except Exception as e:
+                    if self.debug:
+                        print(f"    [Retrain Failed: {e}]")
         
         # Get regime probabilities
         try:

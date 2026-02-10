@@ -40,14 +40,20 @@ class MoAGatingNetwork:
     # Rows: regimes (Growth, Stagnation, Transition, Crisis)
     # Columns: agents (Trend, MeanReversion, Volatility, Crisis)
     DEFAULT_AFFINITY = np.array([
-        [0.7, 0.2, 0.1, 0.0],   # Growth: mostly Trend
-        [0.1, 0.7, 0.2, 0.0],   # Stagnation: mostly MeanReversion
-        [0.2, 0.1, 0.6, 0.1],   # Transition: mostly Volatility
-        [0.4, 0.0, 0.1, 0.5],   # Crisis: Trend (short) + Crisis agent
+        [0.6, 0.2, 0.1, 0.0, 0.9],   # Growth: Trend + ExpMom
+        [0.1, 0.7, 0.2, 0.0, 0.0],   # Stagnation: mostly MeanReversion
+        [0.2, 0.1, 0.6, 0.1, 0.0],   # Transition: mostly Volatility
+        [0.4, 0.0, 0.1, 0.5, 0.0],   # Crisis: Trend + Crisis
     ])
     
     REGIME_NAMES = ['Growth', 'Stagnation', 'Transition', 'Crisis']
-    AGENT_NAMES = ['TrendAgent', 'MeanReversionAgent', 'VolatilityAgent', 'CrisisAgent']
+    AGENT_NAMES = [
+        'TrendAgent', 
+        'MeanReversionAgent', 
+        'VolatilityAgent', 
+        'CrisisAgent',
+        'ExponentialMomentumAgent'
+    ]
     
     def __init__(
         self,
@@ -146,6 +152,8 @@ class MoAGatingNetwork:
         conflicts = [
             (0, 1),  # Trend vs MeanReversion
             (2, 3),  # Volatility vs Crisis (both defensive but different)
+            (4, 1),  # ExpMom vs MeanReversion
+            (4, 3),  # ExpMom vs Crisis
         ]
         
         conflict_score = 0.0

@@ -7,6 +7,7 @@ from .trend_agent import TrendAgent
 from .mean_reversion_agent import MeanReversionAgent
 from .volatility_agent import VolatilityAgent
 from .crisis_agent import CrisisAgent
+from .exponential_momentum_agent import ExponentialMomentumAgent
 
 __all__ = [
     'BaseAgent',
@@ -15,5 +16,6 @@ __all__ = [
     'TrendAgent',
     'MeanReversionAgent',
     'VolatilityAgent',
-    'CrisisAgent'
+    'CrisisAgent',
+    'ExponentialMomentumAgent'
 ]

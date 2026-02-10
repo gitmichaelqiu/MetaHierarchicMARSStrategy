@@ -46,7 +46,7 @@ class MetaController:
         self,
         transaction_cost: float = 0.001,  # 0.1%
         switching_cost_lambda: float = 0.02,  # Reduced to allow more trades
-        max_position: float = 1.0,
+        max_position: float = 2.0,            # Increased to allow leverage (soft limit)
         min_trade_size: float = 0.03,  # Lower threshold for trades
         drawdown_limit: float = 0.20,  # 20% max drawdown (more tolerance)
         kelly_fraction: float = 1.0,  # Full Kelly for more aggressive sizing
@@ -126,7 +126,8 @@ class MetaController:
             expected_volatility = 0.20  # Default 20% vol
         
         # Volatility scaling: reduce position in high vol (but less aggressive)
-        vol_scale = min(1.0, 0.30 / expected_volatility)  # More tolerant of volatility
+        # Allow leverage if volatility is low (up to max_position)
+        vol_scale = min(self.max_position, 0.30 / expected_volatility)
         
         # Kelly-inspired sizing with boost for strong signals
         kelly = abs(signal_strength) * confidence * vol_scale
@@ -138,7 +139,7 @@ class MetaController:
         if abs(signal_strength) > 0.5 and confidence > 0.4:
             position_size = max(position_size, self.min_position_floor * confidence)
         
-        return min(1.0, position_size)
+        return min(self.max_position, position_size)
     
     def _apply_switching_cost_filter(
         self, 
