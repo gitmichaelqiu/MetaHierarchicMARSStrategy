@@ -14,25 +14,26 @@ from typing import Dict, Optional
 # Path setup
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 V7_DIR = os.path.join(PROJECT_ROOT, 'v7')
+V7_IMP_DIR = os.path.join(PROJECT_ROOT, 'v7_improved')
 V1_DIR = os.path.join(PROJECT_ROOT, 'v1')
 
-for p in [V1_DIR, PROJECT_ROOT, V7_DIR]:
+for p in [V1_DIR, PROJECT_ROOT, V7_DIR, V7_IMP_DIR]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
 from base_model_adapter import BaseModelAdapter, BaseModelSignal
 
-# Import V7 components
-from v7.regime_detector import RegimeDetector
-from v7.moa_gating import MoAGatingNetwork
-from v7.moa_ensemble import MoASoftEnsemble
-from v7.meta_controller import MetaController
+# Import V7 Improved components
+from v7_improved.regime_detector import RegimeDetector
+from v7_improved.moa_gating import MoAGatingNetwork
+from v7_improved.moa_ensemble import MoASoftEnsemble
+from v7_improved.meta_controller import MetaController
 
 from agents.trend_agent import TrendAgent
 from agents.mean_reversion_agent import MeanReversionAgent
 from agents.volatility_agent import VolatilityAgent
 from agents.crisis_agent import CrisisAgent
-from v7.v7_agents.exponential_momentum_agent import ExponentialMomentumAgent
+from v7_improved.v7_agents.exponential_momentum_agent import ExponentialMomentumAgent
 
 
 class V7Adapter:
@@ -40,7 +41,7 @@ class V7Adapter:
     
     @property
     def model_name(self) -> str:
-        return "V7-CrossAsset"
+        return "V7-Improved-CrossAsset"
     
     def __init__(self):
         self._ticker: str = ""
