@@ -39,6 +39,7 @@ from allocator.v1_risk_parity import RiskParityAllocator
 from allocator.v2_signal_weighted import SignalWeightedAllocator
 from allocator.v3_mean_variance import MeanVarianceAllocator
 from adapters.v7_adapter import V7Adapter
+from visualization import plot_all_visualizations
 
 
 # ──── Tickers ────
@@ -338,6 +339,8 @@ def run_cio_benchmark(allocator_choice='v1', tickers=None, period='2y'):
             print(f"  {t:>6}  {contrib:>+14.2%}  {bh:>12.2%}")
         
         plot_cio_results(result, alloc_name, tickers)
+        plot_all_visualizations(result, ticker_data, tickers,
+                                 allocator_name=alloc_name)
         all_results[alloc_name] = result
     
     # Compare if multiple

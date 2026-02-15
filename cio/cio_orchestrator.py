@@ -53,6 +53,11 @@ class CIOResult:
     ticker_returns: Dict[str, float] = field(default_factory=dict)
     ticker_contributions: Dict[str, float] = field(default_factory=dict)
     
+    # Signal/regime history for visualization
+    signal_history: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())  # position signals
+    regime_history: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())  # regime labels
+    risk_flag_history: List = field(default_factory=list)
+    
     # Comparison
     equal_weight_return: float = 0.0
     bh_return: float = 0.0
@@ -63,6 +68,13 @@ class CIOOrchestrator:
     Chief Investment Officer — portfolio-level allocation engine.
     """
     
+    # Sector mapping for diversification constraint
+    SECTOR_MAP = {
+        'AAPL': 'tech', 'MSFT': 'tech', 'GOOG': 'tech', 'META': 'tech', 'AMZN': 'tech',
+        'NVDA': 'semi', 'AMD': 'semi', 'TSM': 'semi', 'AVGO': 'semi',
+        'TSLA': 'auto',
+    }
+    
     def __init__(
         self,
         allocator: BaseAllocator,
@@ -71,6 +83,8 @@ class CIOOrchestrator:
         transaction_cost: float = 0.001,
         rebalance_threshold: float = 0.05,
         risk_free_rate: float = 0.04,
+        sector_max_weight: float = 0.45,
+        momentum_window: int = 20,
         debug: bool = True,
     ):
         self.allocator = allocator
@@ -79,6 +93,8 @@ class CIOOrchestrator:
         self.transaction_cost = transaction_cost
         self.rebalance_threshold = rebalance_threshold
         self.risk_free_rate = risk_free_rate
+        self.sector_max_weight = sector_max_weight
+        self.momentum_window = momentum_window
         self.debug = debug
     
     def run(
@@ -134,6 +150,12 @@ class CIOOrchestrator:
         daily_returns = []
         ticker_cum_contrib = {t: 0.0 for t in tickers}
         num_rebalances = 0
+        signal_hist = []
+        regime_hist = []
+        risk_flag_hist = []
+        
+        # Momentum tracking
+        recent_returns: Dict[str, list] = {t: [] for t in tickers}
         
         # Pre-compute index mappings for each ticker
         ticker_idx = {}
@@ -181,6 +203,15 @@ class CIOOrchestrator:
                 daily_returns.append(0.0)
                 continue
             
+            # Track signals and regimes for visualization
+            day_signals = {}
+            day_regimes = {}
+            for t, sig in signals.items():
+                day_signals[t] = sig.position
+                day_regimes[t] = sig.regime
+            signal_hist.append(day_signals)
+            regime_hist.append(day_regimes)
+            
             # 2. Get VIX and correlation for today
             vix_val = self._get_value(vix_data, date_norm)
             corr_val = self._get_value(avg_correlation, date_norm)
@@ -189,9 +220,40 @@ class CIOOrchestrator:
             risk = self.risk_manager.assess_risk(
                 signals, vix_value=vix_val, avg_correlation=corr_val
             )
+            risk_flag_hist.append(risk.risk_flags)
             
             # 4. Compute allocation
             allocation = self.allocator.allocate(signals, max_exposure=risk.max_exposure)
+            
+            # 4b. Momentum overlay — tilt toward recent winners
+            if day_i > self.momentum_window:
+                mom_scores = {}
+                for t in tickers:
+                    if len(recent_returns.get(t, [])) >= self.momentum_window:
+                        mom = sum(recent_returns[t][-self.momentum_window:])
+                        mom_scores[t] = mom
+                
+                if mom_scores:
+                    avg_mom = np.mean(list(mom_scores.values()))
+                    for t in list(allocation.weights.keys()):
+                        if t in mom_scores:
+                            # Boost winners, dampen losers (±20%)
+                            mom_delta = mom_scores[t] - avg_mom
+                            tilt = 1.0 + np.clip(mom_delta * 10, -0.20, 0.20)
+                            allocation.weights[t] *= tilt
+            
+            # 4c. Sector diversification constraint
+            sector_totals: Dict[str, float] = {}
+            for t, w in allocation.weights.items():
+                sector = self.SECTOR_MAP.get(t, 'other')
+                sector_totals[sector] = sector_totals.get(sector, 0) + w
+            
+            for sector, total in sector_totals.items():
+                if total > self.sector_max_weight:
+                    scale = self.sector_max_weight / total
+                    for t in list(allocation.weights.keys()):
+                        if self.SECTOR_MAP.get(t, 'other') == sector:
+                            allocation.weights[t] *= scale
             
             # Apply risk constraints and base model conviction
             target_weights = {}
@@ -252,6 +314,13 @@ class CIOOrchestrator:
                 contrib = w * r
                 port_ret += contrib
                 ticker_cum_contrib[t] += contrib
+            
+            # Update momentum tracking
+            for t in tickers:
+                r = daily_rets.get(t, 0.0)
+                recent_returns[t].append(r)
+                if len(recent_returns[t]) > self.momentum_window * 2:
+                    recent_returns[t] = recent_returns[t][-self.momentum_window:]
             
             # Feed returns to v3 allocator for covariance estimation
             if hasattr(self.allocator, 'update_returns'):
@@ -336,6 +405,9 @@ class CIOOrchestrator:
             cash_history=cash_series,
             ticker_returns=ticker_rets,
             ticker_contributions=ticker_cum_contrib,
+            signal_history=pd.DataFrame(signal_hist, index=dates),
+            regime_history=pd.DataFrame(regime_hist, index=dates),
+            risk_flag_history=risk_flag_hist,
             equal_weight_return=ew_ret,
             bh_return=ew_ret,
         )
