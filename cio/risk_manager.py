@@ -37,8 +37,8 @@ class RiskManager:
         dd_caution: float = 0.08,
         dd_danger: float = 0.15,
         # Correlation thresholds
-        corr_caution: float = 0.55,
-        corr_danger: float = 0.75,
+        corr_caution: float = 0.60,
+        corr_danger: float = 0.80,
         # Cash reserve
         min_cash: float = 0.05,
         max_cash: float = 0.40,
@@ -126,8 +126,8 @@ class RiskManager:
             cash_target = max(cash_target, 0.35)
             scalar *= 0.6
             flags.append(f"MAJORITY_CRISIS ({crisis_count}/{len(signals)})")
-        elif crisis_pct > 0.25:
-            cash_target = max(cash_target, 0.20)
+        elif crisis_pct > 0.40:
+            cash_target = max(cash_target, 0.12)
             flags.append(f"SOME_CRISIS ({crisis_count}/{len(signals)})")
         
         cash_target = min(cash_target, self.max_cash)

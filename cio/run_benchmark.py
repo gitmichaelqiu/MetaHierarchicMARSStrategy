@@ -37,6 +37,7 @@ from cio_orchestrator import CIOOrchestrator, CIOResult
 from risk_manager import RiskManager
 from allocator.v1_risk_parity import RiskParityAllocator
 from allocator.v2_signal_weighted import SignalWeightedAllocator
+from allocator.v3_mean_variance import MeanVarianceAllocator
 from adapters.v7_adapter import V7Adapter
 
 
@@ -44,7 +45,7 @@ from adapters.v7_adapter import V7Adapter
 
 CIO_TICKERS = [
     'AAPL', 'MSFT', 'GOOG', 'NVDA', 'TSLA',
-    'AMD', 'TSM',  # Extended watchlist
+    'AMD', 'TSM', 'AMZN', 'META', 'AVGO',
 ]
 
 
@@ -284,8 +285,11 @@ def run_cio_benchmark(allocator_choice='v1', tickers=None, period='2y'):
     if allocator_choice == 'all':
         allocators['V1 Risk Parity'] = RiskParityAllocator()
         allocators['V2 Signal-Weighted'] = SignalWeightedAllocator()
+        allocators['V3 Mean-Variance'] = MeanVarianceAllocator()
     elif allocator_choice == 'v2':
         allocators['V2 Signal-Weighted'] = SignalWeightedAllocator()
+    elif allocator_choice == 'v3':
+        allocators['V3 Mean-Variance'] = MeanVarianceAllocator()
     else:
         allocators['V1 Risk Parity'] = RiskParityAllocator()
     
@@ -353,7 +357,7 @@ def run_cio_benchmark(allocator_choice='v1', tickers=None, period='2y'):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='CIO Portfolio Benchmark')
-    parser.add_argument('--allocator', choices=['v1', 'v2', 'all'], default='all',
+    parser.add_argument('--allocator', choices=['v1', 'v2', 'v3', 'all'], default='all',
                         help='Allocator to use (default: all)')
     parser.add_argument('--tickers', nargs='+', default=None,
                         help='Override ticker list')

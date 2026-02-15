@@ -193,14 +193,20 @@ class CIOOrchestrator:
             # 4. Compute allocation
             allocation = self.allocator.allocate(signals, max_exposure=risk.max_exposure)
             
-            # Apply position scalar from risk manager and base model signals
+            # Apply risk constraints and base model conviction
             target_weights = {}
             for t, alloc_w in allocation.weights.items():
                 if t in signals:
-                    # Scale by base model position and risk scalar
-                    base_pos = max(signals[t].position, 0.0)  # Only long
-                    # Allocation weight × base model conviction × risk scalar
-                    target_weights[t] = alloc_w * min(base_pos, 1.0) * risk.position_scalar
+                    base_pos = signals[t].position
+                    if base_pos <= 0.05:
+                        # Model says near-zero — don't allocate
+                        target_weights[t] = 0.0
+                    elif base_pos < 0.3:
+                        # Weak conviction — scale down proportionally
+                        target_weights[t] = alloc_w * (base_pos / 0.3) * risk.position_scalar
+                    else:
+                        # Strong conviction — use full allocation weight
+                        target_weights[t] = alloc_w * risk.position_scalar
                 else:
                     target_weights[t] = 0.0
             
@@ -246,6 +252,10 @@ class CIOOrchestrator:
                 contrib = w * r
                 port_ret += contrib
                 ticker_cum_contrib[t] += contrib
+            
+            # Feed returns to v3 allocator for covariance estimation
+            if hasattr(self.allocator, 'update_returns'):
+                self.allocator.update_returns(daily_rets)
             
             # Cash return (daily risk-free)
             port_ret += current_cash_pct * (self.risk_free_rate / 252)
