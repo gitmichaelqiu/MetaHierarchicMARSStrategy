@@ -39,6 +39,7 @@ from allocator.v1_risk_parity import RiskParityAllocator
 from allocator.v2_signal_weighted import SignalWeightedAllocator
 from allocator.v3_mean_variance import MeanVarianceAllocator
 from allocator.v4_conviction_weighted import ConvictionWeightedAllocator
+from allocator.v5_absolute_conviction import AbsoluteConvictionAllocator
 from adapters.v7_adapter import V7Adapter
 from visualization import plot_all_visualizations
 
@@ -288,13 +289,16 @@ def run_cio_benchmark(allocator_choice='v1', tickers=None, period='2y'):
         allocators['V1 Risk Parity'] = RiskParityAllocator()
         allocators['V2 Signal-Weighted'] = SignalWeightedAllocator()
         allocators['V3 Mean-Variance'] = MeanVarianceAllocator()
-        allocators['V4 Conviction-Weighted'] = ConvictionWeightedAllocator()
+        allocators['V4 Conviction-Weights'] = ConvictionWeightedAllocator()
+        allocators['V5 Absolute Conviction'] = AbsoluteConvictionAllocator()
     elif allocator_choice == 'v2':
         allocators['V2 Signal-Weighted'] = SignalWeightedAllocator()
     elif allocator_choice == 'v3':
         allocators['V3 Mean-Variance'] = MeanVarianceAllocator()
     elif allocator_choice == 'v4':
         allocators['V4 Conviction-Weighted'] = ConvictionWeightedAllocator()
+    elif allocator_choice == 'v5':
+        allocators['V5 Absolute Conviction'] = AbsoluteConvictionAllocator()
     else:
         allocators['V1 Risk Parity'] = RiskParityAllocator()
     
@@ -364,7 +368,7 @@ def run_cio_benchmark(allocator_choice='v1', tickers=None, period='2y'):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='CIO Portfolio Benchmark')
-    parser.add_argument('--allocator', choices=['v1', 'v2', 'v3', 'v4', 'all'], default='all',
+    parser.add_argument('--allocator', choices=['v1', 'v2', 'v3', 'v4', 'v5', 'all'], default='all',
                         help='Allocator to use (default: all)')
     parser.add_argument('--tickers', nargs='+', default=None,
                         help='Override ticker list')

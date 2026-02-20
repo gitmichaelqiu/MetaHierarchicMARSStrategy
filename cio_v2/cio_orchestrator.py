@@ -172,7 +172,11 @@ class CIOOrchestrator:
                     continue
                 
                 df = ticker_data[t]
-                sig = adapters[t].get_signal(df, idx)
+                sig = adapters[t].get_signal(
+                    df, 
+                    idx, 
+                    portfolio_drawdown=self.risk_manager.current_drawdown
+                )
                 signals[t] = sig
                 
                 # Daily return for this ticker

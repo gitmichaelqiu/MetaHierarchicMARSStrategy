@@ -68,26 +68,20 @@ class RiskManager:
     ) -> RiskOutput:
         flags = []
         cash_target = self.min_cash
-        scalar = 1.0
+        scalar = 1.0  # V2: We no longer artificially scale positions here to prevent double penalty.
         
-        # Only one layer: VIX extreme protection
+        # Only report VIX extreme for logging, let base models manage their own risk.
         if vix_value is not None and not np.isnan(vix_value):
             if vix_value > self.vix_panic:
-                scalar = 0.5
-                cash_target = 0.30
                 flags.append(f"VIX_PANIC ({vix_value:.1f})")
             elif vix_value > self.vix_extreme:
-                # Gentle scaling: 0.8 at VIX=35, 0.5 at VIX=45
-                t = (vix_value - self.vix_extreme) / (self.vix_panic - self.vix_extreme)
-                scalar = 1.0 - 0.5 * t
-                cash_target = max(cash_target, 0.10 + 0.20 * t)
                 flags.append(f"VIX_EXTREME ({vix_value:.1f})")
         
         max_exposure = 1.0 - cash_target
         
         return RiskOutput(
             max_exposure=max_exposure,
-            position_scalar=scalar,
+            position_scalar=1.0, # Pass-through
             risk_flags=flags,
             metadata={
                 'drawdown': self.current_drawdown,

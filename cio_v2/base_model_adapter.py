@@ -47,13 +47,14 @@ class BaseModelAdapter(Protocol):
         """
         ...
     
-    def get_signal(self, df: pd.DataFrame, idx: int) -> BaseModelSignal:
+    def get_signal(self, df: pd.DataFrame, idx: int, portfolio_drawdown: Optional[float] = None) -> BaseModelSignal:
         """
         Get the model's signal for the current bar.
         
         Args:
             df: Full historical DataFrame
             idx: Current bar index
+            portfolio_drawdown: Actual CIO portfolio drawdown to override local simulations
             
         Returns:
             BaseModelSignal with position, confidence, regime

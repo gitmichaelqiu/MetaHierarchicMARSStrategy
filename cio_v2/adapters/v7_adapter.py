@@ -99,7 +99,7 @@ class V7Adapter:
             pass
         return None
     
-    def get_signal(self, df: pd.DataFrame, idx: int) -> BaseModelSignal:
+    def get_signal(self, df: pd.DataFrame, idx: int, portfolio_drawdown: Optional[float] = None) -> BaseModelSignal:
         current_data = df.iloc[:idx + 1]
         
         if len(current_data) < 60:
@@ -152,6 +152,7 @@ class V7Adapter:
             vix_value=vix_val, vix_term_ratio=vix_tr,
             weekly_trend=wk_trend, sector_trend=sec_trend,
             avg_correlation=avg_corr,
+            external_drawdown=portfolio_drawdown,
         )
         
         # Update controller state

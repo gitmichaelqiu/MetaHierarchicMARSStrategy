@@ -231,6 +231,7 @@ class MetaController:
         weekly_trend: Optional[float] = None,
         sector_trend: Optional[float] = None,
         avg_correlation: Optional[float] = None,
+        external_drawdown: Optional[float] = None,
     ) -> ControllerOutput:
         """6-layer position computation pipeline."""
         
@@ -251,7 +252,7 @@ class MetaController:
         baseline = self._apply_vix(baseline, vix_value, vix_term_ratio)
         
         # 5. Drawdown scaling
-        drawdown = self._compute_drawdown()
+        drawdown = external_drawdown if external_drawdown is not None else self._compute_drawdown()
         baseline = self._apply_drawdown_scaling(baseline, drawdown)
         
         # Alpha overlay (correlation dampens overlay, not baseline)
@@ -281,7 +282,7 @@ class MetaController:
                 'vix_value': vix_value,
                 'vix_term_ratio': vix_term_ratio,
                 'avg_correlation': avg_correlation,
-                'drawdown': drawdown,
+                'drawdown': drawdown, # Will reflect actual portfolio drawdown if provided
             }
         )
     
